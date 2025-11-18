@@ -1,0 +1,156 @@
+import { useEffect, useState } from 'react';
+import { supabase } from '../lib/supabaseClient';
+import useSWR from 'swr';
+
+const fetcher = async (url) => {
+  const { data, error } = await supabase.from('posts').select('*, profiles(username, avatar_url)').order('created_at', { ascending: false }).limit(50);
+  if (error) throw error;
+  return data;
+};
+
+export default function Home() {
+  const { data: posts, mutate } = useSWR('posts', fetcher, { refreshInterval: 1000 });
+  const [content, setContent] = useState('');
+  const [session, setSession] = useState(null);
+
+  useEffect(() => {
+    const s = supabase.auth.getSession().then(r=>setSession(r.data.session));
+    const { data: listener } = supabase.auth.onAuthStateChange((_event, newSession) => setSession(newSession));
+    return () => listener?.subscription?.unsubscribe?.();
+  }, []);
+
+  useEffect(() => {
+    // Realtime: listen for changes in posts
+    const subscription = supabase.channel('public:posts')
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'posts' }, payload => {
+        // Refresh feed
+        mutate();
+      })
+      .subscribe();
+    return () => supabase.removeChannel(subscription);
+  }, [mutate]);
+
+  async function createPost(e) {
+    e.preventDefault();
+    if (!session) return alert('Sign in first');
+    if (!content.trim()) return;
+    await supabase.from('posts').insert({ user_id: session.user.id, content: content.trim() });
+    setContent('');
+    mutate();
+  }
+
+  async function signUp() {
+    const email = prompt('Enter email for signup');
+    if (!email) return;
+    const { error } = await supabase.auth.signUp({ email });
+    if (error) alert(error.message);
+    else alert('Check your email for confirmation link.');
+  }
+
+  async function signIn() {
+    const email = prompt('Enter email');
+    if (!email) return;
+    const { error } = await supabase.auth.signInWithOtp({ email });
+    if (error) alert(error.message);
+    else alert('Check your email for a magic link.');
+  }
+
+  async function signOut(){
+    await supabase.auth.signOut();
+    setSession(null);
+  }
+
+  return (
+    <div className="container">
+      <div className="header">
+        <h1>TradeHub — Traders feed</h1>
+        <div>
+          {session ? (
+            <>
+              <button className="button" onClick={signOut}>Sign out</button>
+            </>
+          ) : (
+            <>
+              <button className="button" onClick={signIn}>Sign in</button>
+              <button style={{marginLeft:8}} className="button" onClick={signUp}>Sign up</button>
+            </>
+          )}
+        </div>
+      </div>
+
+      <div className="card">
+        <form onSubmit={createPost}>
+          <textarea className="input" rows={4} placeholder="Post your trading idea — be clear, share links, charts..." value={content} onChange={e=>setContent(e.target.value)} />
+          <div style={{marginTop:8, display:'flex', justifyContent:'space-between', alignItems:'center'}}>
+            <span className="small">Public • Traders</span>
+            <button className="button" type="submit">Post idea</button>
+          </div>
+        </form>
+      </div>
+
+      <div>
+        {posts ? posts.map(p => (
+          <article key={p.id} className="card">
+            <div style={{display:'flex', gap:12}}>
+              <div style={{width:48,height:48,borderRadius:8,background:'#082231',display:'flex',alignItems:'center',justifyContent:'center'}}>{p.profiles?.username?.[0]?.toUpperCase() || 'U'}</div>
+              <div style={{flex:1}}>
+                <div style={{display:'flex',justifyContent:'space-between',alignItems:'center'}}>
+                  <strong>{p.profiles?.username || 'Unknown'}</strong>
+                  <span className="small">{new Date(p.created_at).toLocaleString()}</span>
+                </div>
+                <p style={{marginTop:8, whiteSpace:'pre-wrap'}}>{p.content}</p>
+                <div style={{marginTop:8,display:'flex',gap:8}}>
+                  <CommentButton postId={p.id} mutate={mutate} />
+                </div>
+              </div>
+            </div>
+          </article>
+        )) : <div className="card small">Loading...</div>}
+      </div>
+    </div>
+  );
+}
+
+function CommentButton({ postId, mutate }) {
+  const [open, setOpen] = useState(false);
+  return (
+    <div>
+      <button className="button" onClick={()=>setOpen(s=>!s)}>Comments</button>
+      {open && <Comments postId={postId} mutate={mutate} />}
+    </div>
+  )
+}
+
+function Comments({ postId, mutate }) {
+  const [comments, setComments] = useState([]);
+  const [text, setText] = useState('');
+  useEffect(()=>{fetchComments();}, [postId]);
+  async function fetchComments() {
+    const { data, error } = await supabase.from('comments').select('*, profiles(username)').eq('post_id', postId).order('created_at', { ascending: true });
+    if (!error) setComments(data || []);
+  }
+  async function add() {
+    const s = await supabase.auth.getSession();
+    const session = s.data.session;
+    if (!session) return alert('Sign in first');
+    if (!text.trim()) return;
+    await supabase.from('comments').insert({ post_id: postId, user_id: session.user.id, content: text.trim() });
+    setText('');
+    fetchComments();
+    mutate();
+  }
+  return (
+    <div style={{marginTop:8}}>
+      {comments.map(c=>(
+        <div className="card" key={c.id} style={{marginBottom:6}}>
+          <div style={{display:'flex',justifyContent:'space-between'}}><strong>{c.profiles?.username || 'User'}</strong><span className="small">{new Date(c.created_at).toLocaleString()}</span></div>
+          <div style={{marginTop:6}}>{c.content}</div>
+        </div>
+      ))}
+      <div style={{display:'flex',gap:8}}>
+        <input className="input" placeholder="Write comment" value={text} onChange={e=>setText(e.target.value)} />
+        <button className="button" onClick={add}>Reply</button>
+      </div>
+    </div>
+  )
+}
